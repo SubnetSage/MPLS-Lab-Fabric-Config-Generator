@@ -66,16 +66,6 @@ Exportable as a **connection guide text file** for easy reference while building
 
 ---
 
-## 🖥️ Screenshots (Optional)
-
-> Add screenshots of:
-
-* Sidebar configuration
-* Generated connection table
-* Config preview window
-
----
-
 ## 🚀 Getting Started
 
 ### 1️⃣ Prerequisites
