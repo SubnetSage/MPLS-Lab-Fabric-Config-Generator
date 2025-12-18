@@ -1,0 +1,719 @@
+import streamlit as st
+import random
+import string
+import ipaddress
+import json
+import pandas as pd
+from io import BytesIO
+import zipfile
+from pyvis.network import Network
+
+PROVIDER_ASN = 65000
+
+# =============================================================================
+# 1) UTILITIES
+# =============================================================================
+
+def generate_hostname(router_type, index):
+    letters = ''.join(random.choices(string.ascii_uppercase, k=2))
+    digits = ''.join(random.choices(string.digits, k=2))
+    return f"{router_type}-{letters}{digits}"
+
+def allocate_loopbacks(total_routers, base_network):
+    net = ipaddress.IPv4Network(base_network)
+    hosts = list(net.hosts())
+    if total_routers > len(hosts):
+        raise ValueError(f"Loopback pool {base_network} too small for {total_routers} routers.")
+    return [str(hosts[i]) for i in range(total_routers)]
+
+def allocate_p2p_links(num_links, base_network):
+    net = ipaddress.IPv4Network(base_network)
+    hosts = list(net.hosts())
+    needed = num_links * 2
+    if needed > len(hosts):
+        raise ValueError(f"P2P pool {base_network} too small for {num_links} links ({needed} IPs needed).")
+    return [(str(hosts[i]), str(hosts[i + 1])) for i in range(0, needed, 2)]
+
+def carve_subnets(base, new_prefix, count):
+    base_net = ipaddress.IPv4Network(base)
+    subnets = list(base_net.subnets(new_prefix=new_prefix))
+    if len(subnets) < count:
+        raise ValueError(f"Pool {base} too small to carve {count} subnets of /{new_prefix}.")
+    return [subnets[i] for i in range(count)]
+
+# =============================================================================
+# 2) RESILIENT CORE TOPOLOGY (P/PE)
+# =============================================================================
+
+def create_core_topology(num_p, num_pe, mode="auto"):
+    """
+    Returns list of edges (a,b) for P/P and P/PE only.
+    Indices: P=[0..num_p-1], PE=[num_p..num_p+num_pe-1]
+    """
+    def add_edge(edges, a, b):
+        if a == b:
+            return
+        edges.add((min(a, b), max(a, b)))
+
+    if num_p < 2:
+        return []
+
+    if mode == "auto":
+        if num_p <= 4:
+            mode = "small"
+        elif num_p <= 8:
+            mode = "medium"
+        else:
+            mode = "large"
+
+    edges = set()
+    p_nodes = list(range(num_p))
+
+    if mode == "small":
+        if num_p == 2:
+            add_edge(edges, 0, 1)
+        else:
+            for i in range(num_p):
+                add_edge(edges, i, (i + 1) % num_p)
+        if num_p >= 4:
+            for i in range(num_p):
+                add_edge(edges, i, (i + 2) % num_p)
+
+    elif mode == "medium":
+        hub_a, hub_b = 0, 1
+        add_edge(edges, hub_a, hub_b)
+        non_hubs = [p for p in p_nodes if p not in (hub_a, hub_b)]
+
+        if len(non_hubs) >= 3:
+            for i in range(len(non_hubs)):
+                add_edge(edges, non_hubs[i], non_hubs[(i + 1) % len(non_hubs)])
+
+        for p in non_hubs:
+            add_edge(edges, p, hub_a)
+            add_edge(edges, p, hub_b)
+
+        if len(non_hubs) >= 5:
+            for i in range(0, len(non_hubs), 2):
+                add_edge(edges, non_hubs[i], non_hubs[(i + 2) % len(non_hubs)])
+
+    elif mode == "large":
+        spine_count = max(2, num_p // 3)
+        spines = list(range(spine_count))
+        aggs = list(range(spine_count, num_p))
+
+        for a in aggs:
+            for s in spines:
+                add_edge(edges, a, s)
+
+        for i in range(len(spines)):
+            add_edge(edges, spines[i], spines[(i + 1) % len(spines)])
+        if len(spines) >= 4:
+            for i in range(len(spines)):
+                add_edge(edges, spines[i], spines[(i + 2) % len(spines)])
+
+        if len(aggs) >= 3:
+            for i in range(len(aggs)):
+                add_edge(edges, aggs[i], aggs[(i + 1) % len(aggs)])
+
+    # PE dual-homing into core
+    for i in range(num_pe):
+        pe_idx = num_p + i
+        if mode in ("small", "medium"):
+            p1 = i % num_p
+            p2 = (i + 1) % num_p
+            add_edge(edges, p1, pe_idx)
+            add_edge(edges, p2, pe_idx)
+        else:
+            spine_count = max(2, num_p // 3)
+            aggs = list(range(spine_count, num_p))
+            if len(aggs) >= 2:
+                a1 = aggs[i % len(aggs)]
+                a2 = aggs[(i + 1) % len(aggs)]
+                add_edge(edges, a1, pe_idx)
+                add_edge(edges, a2, pe_idx)
+            else:
+                p1 = i % num_p
+                p2 = (i + 1) % num_p
+                add_edge(edges, p1, pe_idx)
+                add_edge(edges, p2, pe_idx)
+
+    return sorted(list(edges), key=lambda x: (x[0], x[1]))
+
+# =============================================================================
+# 3) CUSTOMERS + CE BUILDOUT (CE eBGP to PE in VRF)
+# =============================================================================
+
+def default_customers(num_customers, base_asn=65100, default_ce=1):
+    rows = []
+    for i in range(1, num_customers + 1):
+        rows.append({
+            "Customer": f"CUST_{i}",
+            "Customer_ASN": base_asn + i,
+            "CE_Routers": default_ce
+        })
+    return pd.DataFrame(rows)
+
+def assign_ces(customers_df, pe_core_indices):
+    ces = []
+    pe_cursor = 0
+    ce_global = 0
+
+    for _, row in customers_df.iterrows():
+        cust = row["Customer"]
+        asn = int(row["Customer_ASN"])
+        ce_count = int(row["CE_Routers"])
+
+        for k in range(ce_count):
+            ce_global += 1
+            pe_attach = pe_core_indices[pe_cursor % len(pe_core_indices)]
+            pe_cursor += 1
+            ces.append({
+                "type": "CE",
+                "customer": cust,
+                "customer_asn": asn,
+                "hostname": generate_hostname("CE", ce_global),
+                "pe_attach_core_index": pe_attach,
+                "ce_seq": k + 1,
+            })
+    return ces
+
+def allocate_ce_lans(ces, ce_lan_pool, lan_prefix=24):
+    subnets = carve_subnets(ce_lan_pool, lan_prefix, len(ces))
+    for i, ce in enumerate(ces):
+        ce["lan_subnet"] = str(subnets[i])
+        lan = subnets[i]
+        ce["lan_ip"] = str(list(lan.hosts())[0])
+        ce["lan_mask"] = str(lan.netmask)
+    return ces
+
+# =============================================================================
+# 4) VISUAL EXPORT (PYVIS)
+# =============================================================================
+
+def generate_topology_html(nodes, connection_details):
+    net = Network(height="700px", width="100%", bgcolor="#ffffff", font_color="black")
+
+    for n in nodes:
+        t = n["type"]
+        if t == "P":
+            color, size, shape = "#3498db", 18, "diamond"
+        elif t == "PE":
+            color, size, shape = "#e67e22", 14, "dot"
+        elif t == "RR":
+            color, size, shape = "#9b59b6", 16, "diamond"
+        else:
+            color, size, shape = "#2ecc71", 12, "dot"
+
+        label = n["hostname"]
+        if n.get("loopback"):
+            label += f"\n{n['loopback']}"
+        if t == "CE":
+            label += f"\n{n.get('customer','')}"
+        if t == "RR":
+            label += "\n(OOB RR)"
+
+        net.add_node(n["hostname"], label=label, color=color, size=size, shape=shape)
+
+    for conn in connection_details:
+        host_a = "." + conn['IP A'].split('.')[-1]
+        host_b = "." + conn['IP B'].split('.')[-1]
+        label_text = f"{conn['Port A']} ({host_a}) <---> ({host_b}) {conn['Port B']}"
+        if conn.get("VRF"):
+            label_text = f"[{conn['VRF']}] " + label_text
+        if conn.get("LINK_TYPE"):
+            label_text = f"{conn['LINK_TYPE']} | " + label_text
+
+        net.add_edge(
+            conn['From'], conn['To'],
+            label=label_text,
+            color="#95a5a6",
+            font={'size': 9, 'align': 'horizontal', 'color': '#2c3e50'}
+        )
+
+    net.set_options("""
+    var options = {
+      "physics": {
+        "barnesHut": { "gravitationalConstant": -5000, "springLength": 450 }
+      }
+    }
+    """)
+    return net.generate_html()
+
+# =============================================================================
+# 5) CONFIG GENERATORS
+# =============================================================================
+
+def gen_p_config(r, ifaces):
+    lb = r["loopback"]
+    hostname = r["hostname"]
+
+    conf = f"! *** P CORE CONFIG FOR {hostname} ***\n"
+    conf += f"hostname {hostname}\n!\n"
+    conf += "mpls ip\nmpls label protocol ldp\nmpls ldp router-id Loopback0 force\n!\n"
+    conf += f"interface Loopback0\n ip address {lb} 255.255.255.255\n ip ospf 1 area 0\n!\n"
+
+    for iface in ifaces:
+        conf += (
+            f"interface {iface['name']}\n"
+            f" ip address {iface['ip']} {iface['mask']}\n"
+            f" ip ospf 1 area 0\n"
+            f" mpls ip\n"
+            f" mpls ldp interface\n"
+            f" no shutdown\n!\n"
+        )
+
+    conf += f"router ospf 1\n router-id {lb}\n!\nend\n"
+    return conf
+
+def gen_rr_config(rr, ifaces, pe_loopbacks):
+    """
+    OOB Route Reflector:
+      - participates in OSPF so all PEs can reach it
+      - runs MP-BGP vpnv4 with all PEs as RR clients
+      - NOT in data-plane; no MPLS needed
+    """
+    lb = rr["loopback"]
+    hostname = rr["hostname"]
+
+    conf = f"! *** OOB ROUTE REFLECTOR CONFIG FOR {hostname} ***\n"
+    conf += f"hostname {hostname}\n!\n"
+
+    conf += f"interface Loopback0\n ip address {lb} 255.255.255.255\n ip ospf 1 area 0\n!\n"
+
+    for iface in ifaces:
+        conf += (
+            f"interface {iface['name']}\n"
+            f" ip address {iface['ip']} {iface['mask']}\n"
+            f" ip ospf 1 area 0\n"
+            f" no shutdown\n!\n"
+        )
+
+    conf += f"router ospf 1\n router-id {lb}\n!\n"
+
+    conf += f"router bgp {PROVIDER_ASN}\n bgp router-id {lb}\n"
+    for pe_lb in pe_loopbacks:
+        conf += (
+            f" neighbor {pe_lb} remote-as {PROVIDER_ASN}\n"
+            f" neighbor {pe_lb} update-source Loopback0\n"
+        )
+
+    conf += " address-family vpnv4\n"
+    for pe_lb in pe_loopbacks:
+        conf += (
+            f"  neighbor {pe_lb} activate\n"
+            f"  neighbor {pe_lb} send-community both\n"
+            f"  neighbor {pe_lb} route-reflector-client\n"
+        )
+    conf += " exit-address-family\n!\nend\n"
+    return conf
+
+def gen_pe_config(pe, ifaces_core, ifaces_access, customers_df, rr_loopback, ce_pe_neighbors):
+    """
+    PE:
+      - OSPF+MPLS on core
+      - VRFs per customer
+      - eBGP CE neighbors activated under ipv4 vrf
+      - MP-BGP vpnv4 to RR only
+    """
+    lb = pe["loopback"]
+    hostname = pe["hostname"]
+
+    conf = f"! *** PE EDGE CONFIG FOR {hostname} (VRF + CE eBGP + RR) ***\n"
+    conf += f"hostname {hostname}\n!\n"
+
+    for _, row in customers_df.iterrows():
+        cust = row["Customer"]
+        cust_id = int(cust.split("_")[-1])
+        rd = f"{PROVIDER_ASN}:{100 + cust_id}"
+        rt = rd
+        conf += (
+            f"vrf definition {cust}\n"
+            f" rd {rd}\n"
+            f" route-target both {rt}\n"
+            f" address-family ipv4\n"
+            f" exit-address-family\n!\n"
+        )
+
+    conf += "mpls ip\nmpls label protocol ldp\nmpls ldp router-id Loopback0 force\n!\n"
+    conf += f"interface Loopback0\n ip address {lb} 255.255.255.255\n ip ospf 1 area 0\n!\n"
+
+    for iface in ifaces_core:
+        conf += (
+            f"interface {iface['name']}\n"
+            f" ip address {iface['ip']} {iface['mask']}\n"
+            f" ip ospf 1 area 0\n"
+            f" mpls ip\n"
+            f" mpls ldp interface\n"
+            f" no shutdown\n!\n"
+        )
+
+    for iface in ifaces_access:
+        conf += (
+            f"interface {iface['name']}\n"
+            f" vrf forwarding {iface['vrf']}\n"
+            f" ip address {iface['ip']} {iface['mask']}\n"
+            f" no shutdown\n!\n"
+        )
+
+    conf += f"router ospf 1\n router-id {lb}\n!\n"
+
+    conf += f"router bgp {PROVIDER_ASN}\n bgp router-id {lb}\n"
+    conf += f" neighbor {rr_loopback} remote-as {PROVIDER_ASN}\n neighbor {rr_loopback} update-source Loopback0\n"
+
+    # Define CE neighbors globally (remote-as). Activate them under each VRF AF.
+    for n in ce_pe_neighbors:
+        conf += f" neighbor {n['ce_ip']} remote-as {n['cust_asn']}\n"
+
+    conf += " address-family vpnv4\n"
+    conf += f"  neighbor {rr_loopback} activate\n  neighbor {rr_loopback} send-community both\n"
+    conf += " exit-address-family\n"
+
+    for _, row in customers_df.iterrows():
+        cust = row["Customer"]
+        cust_neighbors = [n for n in ce_pe_neighbors if n["cust"] == cust]
+        conf += f" address-family ipv4 vrf {cust}\n"
+        conf += "  redistribute connected\n"
+        for n in cust_neighbors:
+            conf += f"  neighbor {n['ce_ip']} activate\n"
+        conf += " exit-address-family\n"
+
+    conf += "!\nend\n"
+    return conf
+
+def gen_ce_config(ce, iface_access, provider_pe_ip):
+    hostname = ce["hostname"]
+    cust_asn = ce["customer_asn"]
+    lan_net = ipaddress.IPv4Network(ce["lan_subnet"])
+    lan_mask = str(lan_net.netmask)
+    lan_ip = ce["lan_ip"]
+
+    conf = f"! *** CE CONFIG FOR {hostname} ({ce['customer']}) eBGP->PE ***\n"
+    conf += f"hostname {hostname}\n!\n"
+
+    conf += (
+        f"interface {iface_access['name']}\n"
+        f" ip address {iface_access['ip']} {iface_access['mask']}\n"
+        f" no shutdown\n!\n"
+    )
+
+    conf += (
+        f"interface GigabitEthernet0/1\n"
+        f" ip address {lan_ip} {lan_mask}\n"
+        f" no shutdown\n!\n"
+    )
+
+    conf += f"router bgp {cust_asn}\n"
+    conf += f" neighbor {provider_pe_ip} remote-as {PROVIDER_ASN}\n"
+    conf += " address-family ipv4\n"
+    conf += f"  network {lan_net.network_address} mask {lan_mask}\n"
+    conf += f"  neighbor {provider_pe_ip} activate\n"
+    conf += " exit-address-family\n!\nend\n"
+    return conf
+
+# =============================================================================
+# 6) STREAMLIT APP
+# =============================================================================
+
+def main():
+    st.set_page_config(page_title="MPLS Lab Designer", layout="wide")
+    st.title("🌐 MPLS Lab Designer — Resilient Core + VRF + CE eBGP + OOB RR")
+
+    with st.sidebar:
+        st.header("Core (Provider)")
+        num_p = st.number_input("P Nodes", 2, 20, 6)
+        num_pe = st.number_input("PE Nodes", 2, 20, 4)
+        topo_mode = st.selectbox("Topology Mode", ["auto", "small", "medium", "large"], index=0)
+
+        st.divider()
+        st.header("Customers (CE via eBGP)")
+        num_customers = st.number_input("Customers", 1, 50, 3)
+        default_ce = st.number_input("Default CE per Customer", 1, 20, 2)
+        base_cust_asn = st.number_input("Customer ASN Base", 64512, 65534, 65100)
+
+        st.divider()
+        st.header("Address Pools")
+        lp_pool = st.text_input("Loopback Pool (P/PE only)", "10.255.0.0/23")
+        rr_loop_pool = st.text_input("RR Loopback Pool (OOB)", "172.16.255.0/24")
+
+        core_p2p_pool = st.text_input("Core P2P Pool (/31 endpoints)", "10.0.0.0/22")
+        rr_oob_p2p_pool = st.text_input("RR OOB P2P Pool (/31 endpoints)", "172.16.0.0/24")
+
+        access_p2p_pool = st.text_input("Access P2P Pool (PE-CE /31 endpoints)", "10.10.0.0/22")
+        ce_lan_pool = st.text_input("CE LAN Pool (carved into /24s)", "192.168.0.0/16")
+
+        generate_btn = st.button("🚀 Build Lab", type="primary")
+
+    # Editable customer table
+    if "customers_df" not in st.session_state or st.session_state.get("customers_df_seed") != (int(num_customers), int(base_cust_asn), int(default_ce)):
+        st.session_state["customers_df"] = default_customers(int(num_customers), base_asn=int(base_cust_asn), default_ce=int(default_ce))
+        st.session_state["customers_df_seed"] = (int(num_customers), int(base_cust_asn), int(default_ce))
+
+    st.subheader("👥 Customers (edit CE count / ASN if you want)")
+    customers_df = st.data_editor(
+        st.session_state["customers_df"],
+        use_container_width=True,
+        num_rows="fixed"
+    )
+    st.session_state["customers_df"] = customers_df
+
+    if generate_btn:
+        try:
+            # -----------------------------
+            # Build router inventory
+            # -----------------------------
+            core_total = int(num_p) + int(num_pe)
+
+            core_loopbacks = allocate_loopbacks(core_total, lp_pool)
+            rr_loopbacks = allocate_loopbacks(1, rr_loop_pool)
+            rr_loopback = rr_loopbacks[0]
+
+            routers = []
+            p_lbs, pe_lbs = [], []
+
+            for i in range(int(num_p)):
+                r = {"type": "P", "hostname": generate_hostname("P", i), "loopback": core_loopbacks[i], "index": i}
+                routers.append(r)
+                p_lbs.append(r["loopback"])
+
+            for i in range(int(num_pe)):
+                idx = int(num_p) + i
+                r = {"type": "PE", "hostname": generate_hostname("PE", i), "loopback": core_loopbacks[idx], "index": idx}
+                routers.append(r)
+                pe_lbs.append(r["loopback"])
+
+            # RR as its own node AFTER core
+            rr_index = core_total
+            rr = {"type": "RR", "hostname": "RR-OOB", "loopback": rr_loopback, "index": rr_index}
+            routers.append(rr)
+
+            # -----------------------------
+            # Core topology edges (P/PE)
+            # -----------------------------
+            core_edges = create_core_topology(int(num_p), int(num_pe), mode=topo_mode)
+
+            # RR OOB edges -> connect RR to two P routers for resilience
+            rr_edges = []
+            p_attach_a = 0
+            p_attach_b = 1 if int(num_p) > 1 else 0
+            rr_edges.append((p_attach_a, rr_index))
+            if p_attach_b != p_attach_a:
+                rr_edges.append((p_attach_b, rr_index))
+
+            # -----------------------------
+            # Customers / CEs
+            # -----------------------------
+            pe_core_indices = list(range(int(num_p), int(num_p) + int(num_pe)))
+            ces = assign_ces(customers_df, pe_core_indices)
+            ces = allocate_ce_lans(ces, ce_lan_pool, lan_prefix=24)
+
+            # Add CE nodes to routers list (after RR)
+            ce_start_index = len(routers)
+            for i, ce in enumerate(ces):
+                ce["index"] = ce_start_index + i
+                routers.append(ce)
+
+            # Access edges (PE<->CE)
+            access_edges = []
+            for ce in ces:
+                access_edges.append((ce["pe_attach_core_index"], ce["index"]))
+
+            # -----------------------------
+            # IP allocation for links
+            # -----------------------------
+            # Core links
+            core_p2p = allocate_p2p_links(len(core_edges), core_p2p_pool)
+            # RR OOB links
+            rr_p2p = allocate_p2p_links(len(rr_edges), rr_oob_p2p_pool)
+            # Access links
+            access_p2p = allocate_p2p_links(len(access_edges), access_p2p_pool)
+
+            # Interfaces + connection details
+            total_nodes = len(routers)
+            iface_counters = {i: 0 for i in range(total_nodes)}
+            router_ifaces_core = {i: [] for i in range(total_nodes)}   # core+oob (ospf)
+            router_ifaces_access = {i: [] for i in range(total_nodes)} # pe-ce (vrf on pe)
+            conn_details = []
+
+            def add_link(a, b, ip_a, ip_b, link_type, vrf=None, core_link=True):
+                if_a = f"Gi0/{iface_counters[a]}"
+                if_b = f"Gi0/{iface_counters[b]}"
+                iface_counters[a] += 1
+                iface_counters[b] += 1
+
+                # If core_link: OSPF + (MPLS later for P/PE) on PE/P, RR just OSPF
+                if core_link:
+                    router_ifaces_core[a].append({"name": if_a, "ip": ip_a, "mask": "255.255.255.254"})
+                    router_ifaces_core[b].append({"name": if_b, "ip": ip_b, "mask": "255.255.255.254"})
+                else:
+                    # access: PE side uses vrf, CE side plain
+                    # Determine which side is PE
+                    a_type = routers[a]["type"]
+                    b_type = routers[b]["type"]
+
+                    if a_type == "PE":
+                        router_ifaces_access[a].append({"name": if_a, "ip": ip_a, "mask": "255.255.255.254", "vrf": vrf})
+                        router_ifaces_access[b].append({"name": if_b, "ip": ip_b, "mask": "255.255.255.254"})
+                    elif b_type == "PE":
+                        router_ifaces_access[b].append({"name": if_b, "ip": ip_b, "mask": "255.255.255.254", "vrf": vrf})
+                        router_ifaces_access[a].append({"name": if_a, "ip": ip_a, "mask": "255.255.255.254"})
+                    else:
+                        # fallback
+                        router_ifaces_access[a].append({"name": if_a, "ip": ip_a, "mask": "255.255.255.254"})
+                        router_ifaces_access[b].append({"name": if_b, "ip": ip_b, "mask": "255.255.255.254"})
+
+                conn = {
+                    "From": routers[a]["hostname"],
+                    "Port A": if_a,
+                    "IP A": ip_a,
+                    "To": routers[b]["hostname"],
+                    "Port B": if_b,
+                    "IP B": ip_b,
+                    "LINK_TYPE": link_type
+                }
+                if vrf:
+                    conn["VRF"] = vrf
+                conn_details.append(conn)
+
+            # Core edges
+            for i, (a, b) in enumerate(core_edges):
+                ip_a, ip_b = core_p2p[i]
+                add_link(a, b, ip_a, ip_b, link_type="CORE", core_link=True)
+
+            # RR OOB edges (still OSPF so PEs can reach RR loopback)
+            for i, (a, b) in enumerate(rr_edges):
+                ip_a, ip_b = rr_p2p[i]
+                add_link(a, b, ip_a, ip_b, link_type="OOB-RR", core_link=True)
+
+            # Access edges (PE-CE), VRF based on CE customer
+            ce_by_index = {ce["index"]: ce for ce in ces}
+            for i, (a, b) in enumerate(access_edges):
+                ip_a, ip_b = access_p2p[i]
+                ce = ce_by_index[b] if routers[b]["type"] == "CE" else ce_by_index[a]
+                add_link(a, b, ip_a, ip_b, link_type="ACCESS", vrf=ce["customer"], core_link=False)
+
+            # -----------------------------
+            # Build CE neighbor mapping per PE (for PE VRF eBGP activation)
+            # -----------------------------
+            pe_ce_neighbors = {idx: [] for idx in pe_core_indices}
+
+            # We need to know CE IP and PE IP on the /31
+            # Use conn_details to derive it per ACCESS link
+            for conn in conn_details:
+                if conn.get("LINK_TYPE") != "ACCESS":
+                    continue
+                # Identify which side is PE
+                from_name = conn["From"]
+                to_name = conn["To"]
+                a_idx = next(i for i, r in enumerate(routers) if r["hostname"] == from_name)
+                b_idx = next(i for i, r in enumerate(routers) if r["hostname"] == to_name)
+
+                a_type = routers[a_idx]["type"]
+                b_type = routers[b_idx]["type"]
+
+                if a_type == "PE" and b_type == "CE":
+                    pe_idx = a_idx
+                    ce_idx = b_idx
+                    pe_ip = conn["IP A"]
+                    ce_ip = conn["IP B"]
+                elif b_type == "PE" and a_type == "CE":
+                    pe_idx = b_idx
+                    ce_idx = a_idx
+                    pe_ip = conn["IP B"]
+                    ce_ip = conn["IP A"]
+                else:
+                    continue
+
+                ce = ce_by_index[ce_idx]
+                pe_ce_neighbors[pe_idx].append({
+                    "cust": ce["customer"],
+                    "cust_asn": ce["customer_asn"],
+                    "ce_ip": ce_ip,
+                    "pe_ip": pe_ip,
+                    "ce_hostname": ce["hostname"]
+                })
+
+            # -----------------------------
+            # Generate configs
+            # -----------------------------
+            configs = {}
+
+            # P configs (no BGP)
+            for r in routers:
+                if r["type"] == "P":
+                    configs[r["hostname"]] = gen_p_config(r, router_ifaces_core[r["index"]])
+
+            # RR config
+            configs[rr["hostname"]] = gen_rr_config(rr, router_ifaces_core[rr_index], pe_lbs)
+
+            # PE configs
+            for r in routers:
+                if r["type"] == "PE":
+                    configs[r["hostname"]] = gen_pe_config(
+                        r,
+                        ifaces_core=router_ifaces_core[r["index"]],
+                        ifaces_access=router_ifaces_access[r["index"]],
+                        customers_df=customers_df,
+                        rr_loopback=rr_loopback,
+                        ce_pe_neighbors=pe_ce_neighbors[r["index"]]
+                    )
+
+            # CE configs
+            # Need CE access iface + provider PE IP on that link
+            for ce in ces:
+                ce_idx = ce["index"]
+                # Find that CE's access link in neighbors map
+                pe_idx = ce["pe_attach_core_index"]
+                n = next(x for x in pe_ce_neighbors[pe_idx] if x["ce_hostname"] == ce["hostname"])
+                # CE iface: first (and only) in router_ifaces_access
+                ce_iface = router_ifaces_access[ce_idx][0]
+                configs[ce["hostname"]] = gen_ce_config(ce, ce_iface, provider_pe_ip=n["pe_ip"])
+
+            # Save state
+            st.session_state.update({
+                "configs": configs,
+                "routers": routers,
+                "conn_details": conn_details,
+                "ai_context": {
+                    "inventory": routers,
+                    "topology": conn_details,
+                    "customers": customers_df.to_dict(orient="records"),
+                    "rr": rr,
+                    "configs": configs,
+                    "counts": {"P": int(num_p), "PE": int(num_pe), "RR": 1, "CE": len(ces)},
+                    "topology_mode": topo_mode
+                }
+            })
+
+        except Exception as e:
+            st.error(f"Build failed: {e}")
+
+    # =============================================================================
+    # OUTPUTS
+    # =============================================================================
+
+    if "configs" in st.session_state and st.session_state.get("conn_details"):
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            buf = BytesIO()
+            with zipfile.ZipFile(buf, "w") as zf:
+                for h, c in st.session_state["configs"].items():
+                    zf.writestr(f"{h}.txt", c)
+            st.download_button("📦 ZIP Configs", buf.getvalue(), "lab_configs.zip")
+
+        with c2:
+            html = generate_topology_html(st.session_state["routers"], st.session_state["conn_details"])
+            st.download_button("🌐 Download Diagram (HTML)", html, "topology.html", "text/html")
+
+        with c3:
+            st.download_button("🤖 AI JSON Context", json.dumps(st.session_state["ai_context"], indent=4), "ai_context.json")
+
+        st.subheader("📋 Detailed Interconnect Table")
+        st.table(pd.DataFrame(st.session_state["conn_details"]))
+
+        st.divider()
+        sel = st.selectbox("Preview Config", list(st.session_state["configs"].keys()))
+        st.code(st.session_state["configs"][sel], language="bash")
+
+if __name__ == "__main__":
+    main()
