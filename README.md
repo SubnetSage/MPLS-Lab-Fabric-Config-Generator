@@ -1,188 +1,78 @@
-# 🛰️ MPLS Fabric Generator
 
-A **multi-vendor MPLS lab and baseline configuration generator** built with **Streamlit**, designed for **Service Provider–style P and PE routers**.
+# 🌐 MPLS Lab Architect & Digital Twin Generator
 
-This tool generates:
+A Python-based automation tool designed to eliminate the manual "plumbing" of MPLS service provider labs. This tool generates full-stack configurations for Cisco/Juniper environments, creates interactive topology diagrams, and exports a machine-readable **Digital Twin** for AI-assisted troubleshooting.
 
-* Vendor-accurate **Cisco IOS-XE** and **Juniper JunOS** MPLS configs
-* Deterministic IP addressing
-* Auto-generated hostnames
-* A **physical cabling / interface connection guide**
-* Downloadable per-router configs or ZIP bundles
+## 🚀 Key Features
 
-Perfect for **CCNP / JNCIP labs**, **MPLS learning**, and **rapid lab bring-up**.
+* **Full-Stack Control Plane:** Automatically generates boilerplate and advanced logic for:
+* **OSPF:** IGP reachability for all Loopbacks and P2P links.
+* **LDP:** Label Distribution Protocol for the MPLS transport core.
+* **MP-BGP:** VPNv4 iBGP mesh with Route Reflector (P-node) and Client (PE-node) logic.
 
----
 
-## ✨ Features
+* **Multi-Tenant VRF Support:** Pre-configures L3VPN instances (`CUSTOMER_A`) with unique Route Distinguishers (RD) and Route Targets (RT) for end-to-end testing.
+* **Interactive Topology Visualization:** Generates a standalone HTML map (via Pyvis) featuring:
+* Real-time physics for clean node separation.
+* **Host-bit labeling** (e.g., `.1` <--> `.2`) on interfaces for rapid visual orientation.
 
-### 🔀 Multi-Vendor Support
 
-* **Cisco**
+* **AI-Ready "Digital Twin" Export:** Exports a comprehensive JSON file containing the total state of the lab. Upload this to an LLM (Gemini/ChatGPT) to give it perfect topology awareness for troubleshooting.
+* **Dynamic Cabling Tables:** Generates a precise port-to-port interconnect matrix.
 
-  * IOS-style syntax
-  * OSPF + MPLS LDP
-  * VRFs on PE routers
-  * Optional MP-BGP (full-mesh or route-reflector)
-* **Juniper**
+## 🛠️ Tech Stack
 
-  * JunOS `set` syntax
-  * OSPF + MPLS + LDP
-  * VRFs using `routing-instances`
-  * Optional MP-BGP
+* **Python 3.10+**
+* **Streamlit:** For the web-based UI.
+* **Pyvis:** For the graph theory and topology visualization.
+* **Pandas:** For data organization and cabling table rendering.
 
----
+## 📦 Installation & Usage
 
-### 🧠 Intelligent Lab Logic
-
-* Random but readable hostnames (`P-A7F3`, `PE-K9D2`)
-* `/32` loopbacks for router IDs
-* `/31` point-to-point core links
-* Automatic **ring topology**
-* Sequential interface assignment per router
-
----
-
-### 🔌 Physical Connection Guide
-
-The app **tells you exactly how to cable your lab**:
-
-* Router A ↔ Router B
-* Interface names on both sides
-* IP addresses per link
-
-Exportable as a **connection guide text file** for easy reference while building labs.
-
----
-
-### 📦 Flexible Downloads
-
-* Preview configs per router in the UI
-* Download:
-
-  * Individual router configs
-  * Full ZIP archive of all configs
-  * Physical connection guide
-
----
-
-## 🚀 Getting Started
-
-### 1️⃣ Prerequisites
-
-* Python **3.9+**
-* `pip`
-
-### 2️⃣ Install Dependencies
-
+1. **Clone the repository:**
 ```bash
-pip install streamlit
+git clone https://github.com/yourusername/mpls-lab-architect.git
+cd mpls-lab-architect
+
 ```
 
-### 3️⃣ Run the App
 
+2. **Install dependencies:**
 ```bash
-streamlit run mpls-baseline-configurator.py
-```
-
-The app will open in your browser:
+pip install streamlit pyvis pandas
 
 ```
-http://localhost:8501
+
+
+3. **Run the application:**
+```bash
+streamlit run mpls_architect.py
+
 ```
 
----
 
-## ⚙️ Configuration Options
+4. **Generate your lab:**
+* Adjust P and PE node counts in the sidebar.
+* Click **"Build Lab"**.
+* Download the `.zip` of configurations and the `.json` AI context.
 
-### Vendor Selection
 
-* Cisco
-* Juniper
 
-### Router Counts
+## 🤖 The "AI Context" Workflow
 
-* Number of **P routers**
-* Number of **PE routers**
+This tool solves the "hallucination" problem when using AI for networking.
 
-### Interface Naming
+1. Generate your lab.
+2. Download `ai_context.json`.
+3. Upload the JSON to your AI assistant.
+4. **Prompt:** *"I am working on this MPLS lab. Using the attached topology and config data, help me identify why PE-1 cannot see the VPNv4 routes from PE-4."*
 
-Examples:
+## 📄 License
 
-* Cisco: `GigabitEthernet0/0`, `TenGigabitEthernet0/0`
-* Juniper: `ge-0/0/0`, `xe-0/0/0`
-
-### IP Addressing
-
-Defaults:
-
-* Loopbacks: `10.255.0.0/24`
-* Core P2P links: `10.0.0.0/24`
+Distributed under the MIT License. See `LICENSE` for more information.
 
 ---
 
-## 🧪 Generated Technologies
+### Suggested Next Step
 
-| Technology        | P Routers | PE Routers |
-| ----------------- | --------- | ---------- |
-| Loopbacks         | ✅         | ✅          |
-| OSPF Area 0       | ✅         | ✅          |
-| MPLS              | ✅         | ✅          |
-| LDP               | ✅         | ✅          |
-| VRF               | ❌         | ✅          |
-| MP-BGP (optional) | RR only   | ✅          |
-
----
-
-## 🧱 Topology Model
-
-* Default: **Ring topology**
-* Each router connects to two neighbors
-* Interface numbering increments automatically
-
----
-
-## 📂 Output Structure
-
-```text
-P-A7F3.txt
-P-J2K9.txt
-PE-Q8L4.txt
-PE-M3R7.txt
-mpls_connection_guide_cisco.txt
-```
-
----
-
-## 🎯 Use Cases
-
-* MPLS fundamentals labs
-* CCNP Service Provider study
-* JNCIP study
-* Network automation demos
-* Rapid MPLS lab bring-up
-* Teaching or mentoring environments
-
----
-
-## 🛣️ Roadmap (Ideas)
-
-* IS-IS support
-* Segment Routing (SR-MPLS)
-* EVPN / L3VPN
-* Graphviz topology diagrams
-* IOS-XR support
-* Juniper logical systems
-
----
-
-## ⚠️ Disclaimer
-
-This tool is intended for **lab, educational, and testing purposes**.
-Always validate configurations before deploying to production networks.
-
----
-
-## 📜 License
-
-MIT License — use freely, modify responsibly.
+**Would you like me to help you write the `LICENSE` file or a `requirements.txt` file to include in your repository?**
