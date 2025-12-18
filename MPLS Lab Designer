@@ -9,6 +9,9 @@ import zipfile
 from pyvis.network import Network
 
 PROVIDER_ASN = 65000
+INTERNET_VRF_NAME = "INTERNET"
+INTERNET_RT = f"{PROVIDER_ASN}:999"
+INTERNET_RD = f"{PROVIDER_ASN}:999"
 
 # =============================================================================
 # 1) UTILITIES
@@ -41,15 +44,16 @@ def carve_subnets(base, new_prefix, count):
         raise ValueError(f"Pool {base} too small to carve {count} subnets of /{new_prefix}.")
     return [subnets[i] for i in range(count)]
 
+def wildcard_from_netmask(netmask: str) -> str:
+    parts = [int(x) for x in netmask.split(".")]
+    wc = [str(255 - p) for p in parts]
+    return ".".join(wc)
+
 # =============================================================================
 # 2) RESILIENT CORE TOPOLOGY (P/PE)
 # =============================================================================
 
 def create_core_topology(num_p, num_pe, mode="auto"):
-    """
-    Returns list of edges (a,b) for P/P and P/PE only.
-    Indices: P=[0..num_p-1], PE=[num_p..num_p+num_pe-1]
-    """
     def add_edge(edges, a, b):
         if a == b:
             return
@@ -67,7 +71,6 @@ def create_core_topology(num_p, num_pe, mode="auto"):
             mode = "large"
 
     edges = set()
-    p_nodes = list(range(num_p))
 
     if mode == "small":
         if num_p == 2:
@@ -82,7 +85,7 @@ def create_core_topology(num_p, num_pe, mode="auto"):
     elif mode == "medium":
         hub_a, hub_b = 0, 1
         add_edge(edges, hub_a, hub_b)
-        non_hubs = [p for p in p_nodes if p not in (hub_a, hub_b)]
+        non_hubs = [p for p in range(num_p) if p not in (hub_a, hub_b)]
 
         if len(non_hubs) >= 3:
             for i in range(len(non_hubs)):
@@ -140,7 +143,7 @@ def create_core_topology(num_p, num_pe, mode="auto"):
     return sorted(list(edges), key=lambda x: (x[0], x[1]))
 
 # =============================================================================
-# 3) CUSTOMERS + CE BUILDOUT (CE eBGP to PE in VRF)
+# 3) CUSTOMERS + CE BUILDOUT
 # =============================================================================
 
 def default_customers(num_customers, base_asn=65100, default_ce=1):
@@ -149,7 +152,10 @@ def default_customers(num_customers, base_asn=65100, default_ce=1):
         rows.append({
             "Customer": f"CUST_{i}",
             "Customer_ASN": base_asn + i,
-            "CE_Routers": default_ce
+            "CE_Routers": default_ce,
+            "Handoff_Type": "eBGP",          # eBGP | OSPF | Static
+            "LANs_per_CE": 1,
+            "Leak_Via_Internet": False       # route leak via INTERNET VRF RT-bus
         })
     return pd.DataFrame(rows)
 
@@ -159,31 +165,43 @@ def assign_ces(customers_df, pe_core_indices):
     ce_global = 0
 
     for _, row in customers_df.iterrows():
-        cust = row["Customer"]
+        cust = str(row["Customer"])
         asn = int(row["Customer_ASN"])
         ce_count = int(row["CE_Routers"])
+        handoff = str(row.get("Handoff_Type", "eBGP"))
+        lans_per_ce = int(row.get("LANs_per_CE", 1))
 
         for k in range(ce_count):
             ce_global += 1
             pe_attach = pe_core_indices[pe_cursor % len(pe_core_indices)]
             pe_cursor += 1
+
             ces.append({
                 "type": "CE",
                 "customer": cust,
                 "customer_asn": asn,
+                "handoff_type": handoff,
+                "lans_per_ce": max(1, lans_per_ce),
                 "hostname": generate_hostname("CE", ce_global),
                 "pe_attach_core_index": pe_attach,
                 "ce_seq": k + 1,
             })
     return ces
 
-def allocate_ce_lans(ces, ce_lan_pool, lan_prefix=24):
-    subnets = carve_subnets(ce_lan_pool, lan_prefix, len(ces))
-    for i, ce in enumerate(ces):
-        ce["lan_subnet"] = str(subnets[i])
-        lan = subnets[i]
-        ce["lan_ip"] = str(list(lan.hosts())[0])
-        ce["lan_mask"] = str(lan.netmask)
+def allocate_ce_lans_multi(ces, ce_lan_pool, lan_prefix=24):
+    total_lans = sum(int(ce["lans_per_ce"]) for ce in ces)
+    subnets = carve_subnets(ce_lan_pool, lan_prefix, total_lans)
+
+    cursor = 0
+    for ce in ces:
+        k = int(ce["lans_per_ce"])
+        ce_subs = subnets[cursor:cursor + k]
+        cursor += k
+
+        ce["lan_subnets"] = [str(s) for s in ce_subs]
+        ce["lan_ips"] = [str(list(s.hosts())[0]) for s in ce_subs]
+        ce["lan_masks"] = [str(s.netmask) for s in ce_subs]
+
     return ces
 
 # =============================================================================
@@ -209,6 +227,7 @@ def generate_topology_html(nodes, connection_details):
             label += f"\n{n['loopback']}"
         if t == "CE":
             label += f"\n{n.get('customer','')}"
+            label += f"\n{n.get('handoff_type','')}"
         if t == "RR":
             label += "\n(OOB RR)"
 
@@ -265,13 +284,7 @@ def gen_p_config(r, ifaces):
     conf += f"router ospf 1\n router-id {lb}\n!\nend\n"
     return conf
 
-def gen_rr_config(rr, ifaces, pe_loopbacks):
-    """
-    OOB Route Reflector:
-      - participates in OSPF so all PEs can reach it
-      - runs MP-BGP vpnv4 with all PEs as RR clients
-      - NOT in data-plane; no MPLS needed
-    """
+def gen_rr_config(rr, ifaces, pe_loopbacks, bgp_keepalive, bgp_hold):
     lb = rr["loopback"]
     hostname = rr["hostname"]
 
@@ -290,7 +303,11 @@ def gen_rr_config(rr, ifaces, pe_loopbacks):
 
     conf += f"router ospf 1\n router-id {lb}\n!\n"
 
-    conf += f"router bgp {PROVIDER_ASN}\n bgp router-id {lb}\n"
+    conf += f"router bgp {PROVIDER_ASN}\n"
+    conf += " bgp log-neighbor-changes\n"
+    conf += f" timers bgp {bgp_keepalive} {bgp_hold}\n"
+    conf += f" bgp router-id {lb}\n"
+
     for pe_lb in pe_loopbacks:
         conf += (
             f" neighbor {pe_lb} remote-as {PROVIDER_ASN}\n"
@@ -307,33 +324,64 @@ def gen_rr_config(rr, ifaces, pe_loopbacks):
     conf += " exit-address-family\n!\nend\n"
     return conf
 
-def gen_pe_config(pe, ifaces_core, ifaces_access, customers_df, rr_loopback, ce_pe_neighbors):
-    """
-    PE:
-      - OSPF+MPLS on core
-      - VRFs per customer
-      - eBGP CE neighbors activated under ipv4 vrf
-      - MP-BGP vpnv4 to RR only
-    """
+def gen_pe_config(
+    pe,
+    ifaces_core,
+    ifaces_access,
+    customers_df,
+    rr_loopback,
+    pe_ce_neighbors,
+    bgp_keepalive,
+    bgp_hold,
+    ebgp_multihop,
+    add_internet_default
+):
     lb = pe["loopback"]
     hostname = pe["hostname"]
 
-    conf = f"! *** PE EDGE CONFIG FOR {hostname} (VRF + CE eBGP + RR) ***\n"
+    # lookup per customer
+    cust_handoff = {str(r["Customer"]): str(r.get("Handoff_Type", "eBGP")) for _, r in customers_df.iterrows()}
+    cust_leak = {str(r["Customer"]): bool(r.get("Leak_Via_Internet", False)) for _, r in customers_df.iterrows()}
+
+    conf = f"! *** PE EDGE CONFIG FOR {hostname} (VRF + RR + Route Leaking) ***\n"
     conf += f"hostname {hostname}\n!\n"
 
+    # ---- INTERNET VRF (shared leaking bus)
+    conf += (
+        f"vrf definition {INTERNET_VRF_NAME}\n"
+        f" rd {INTERNET_RD}\n"
+        f" route-target both {INTERNET_RT}\n"
+        f" address-family ipv4\n"
+        f" exit-address-family\n!\n"
+    )
+
+    # ---- Customer VRFs (with optional RT leaking to/from INTERNET)
     for _, row in customers_df.iterrows():
-        cust = row["Customer"]
+        cust = str(row["Customer"])
         cust_id = int(cust.split("_")[-1])
-        rd = f"{PROVIDER_ASN}:{100 + cust_id}"
-        rt = rd
+        cust_rt = f"{PROVIDER_ASN}:{100 + cust_id}"
+        cust_rd = cust_rt
+
+        leak = cust_leak.get(cust, False)
+
+        conf += f"vrf definition {cust}\n"
+        conf += f" rd {cust_rd}\n"
+        # always keep native RT
+        conf += f" route-target both {cust_rt}\n"
+
+        # route leaking:
+        # - If leak enabled, export INTERNET RT (so customer routes also carry INTERNET RT)
+        # - If leak enabled, import INTERNET RT (so customer learns any routes tagged INTERNET RT)
+        if leak:
+            conf += f" route-target export {INTERNET_RT}\n"
+            conf += f" route-target import {INTERNET_RT}\n"
+
         conf += (
-            f"vrf definition {cust}\n"
-            f" rd {rd}\n"
-            f" route-target both {rt}\n"
             f" address-family ipv4\n"
             f" exit-address-family\n!\n"
         )
 
+    # MPLS core
     conf += "mpls ip\nmpls label protocol ldp\nmpls ldp router-id Loopback0 force\n!\n"
     conf += f"interface Loopback0\n ip address {lb} 255.255.255.255\n ip ospf 1 area 0\n!\n"
 
@@ -347,47 +395,117 @@ def gen_pe_config(pe, ifaces_core, ifaces_access, customers_df, rr_loopback, ce_
             f" no shutdown\n!\n"
         )
 
+    # Access interfaces
     for iface in ifaces_access:
-        conf += (
-            f"interface {iface['name']}\n"
-            f" vrf forwarding {iface['vrf']}\n"
-            f" ip address {iface['ip']} {iface['mask']}\n"
-            f" no shutdown\n!\n"
-        )
+        vrf = iface["vrf"]
+        htype = cust_handoff.get(vrf, "eBGP").upper()
+        conf += f"interface {iface['name']}\n"
+        conf += f" vrf forwarding {vrf}\n"
+        conf += f" ip address {iface['ip']} {iface['mask']}\n"
+        if htype == "OSPF":
+            pid = 100 + int(vrf.split("_")[-1])
+            conf += f" ip ospf {pid} area 0\n"
+        conf += " no shutdown\n!\n"
 
+    # Core OSPF
     conf += f"router ospf 1\n router-id {lb}\n!\n"
 
-    conf += f"router bgp {PROVIDER_ASN}\n bgp router-id {lb}\n"
-    conf += f" neighbor {rr_loopback} remote-as {PROVIDER_ASN}\n neighbor {rr_loopback} update-source Loopback0\n"
+    # VRF-aware OSPF processes if needed
+    for _, row in customers_df.iterrows():
+        cust = str(row["Customer"])
+        htype = str(row.get("Handoff_Type", "eBGP")).upper()
+        if htype == "OSPF":
+            pid = 100 + int(cust.split("_")[-1])
+            conf += (
+                f"router ospf {pid} vrf {cust}\n"
+                f" router-id {lb}\n"
+                f"!\n"
+            )
 
-    # Define CE neighbors globally (remote-as). Activate them under each VRF AF.
-    for n in ce_pe_neighbors:
-        conf += f" neighbor {n['ce_ip']} remote-as {n['cust_asn']}\n"
+    # Optional: create an INTERNET VRF “default” (lab stub) + redistribute static
+    if add_internet_default:
+        conf += f"ip route vrf {INTERNET_VRF_NAME} 0.0.0.0 0.0.0.0 Null0\n"
 
+    # BGP
+    conf += f"router bgp {PROVIDER_ASN}\n"
+    conf += " bgp log-neighbor-changes\n"
+    conf += f" timers bgp {bgp_keepalive} {bgp_hold}\n"
+    conf += f" bgp router-id {lb}\n"
+    conf += f" neighbor {rr_loopback} remote-as {PROVIDER_ASN}\n"
+    conf += f" neighbor {rr_loopback} update-source Loopback0\n"
+
+    # Define CE neighbors only for eBGP handoff customers
+    for n in pe_ce_neighbors:
+        cust = n["cust"]
+        htype = cust_handoff.get(cust, "eBGP").upper()
+        if htype == "EBGP":
+            conf += f" neighbor {n['ce_ip']} remote-as {n['cust_asn']}\n"
+            if int(ebgp_multihop) > 1:
+                conf += f" neighbor {n['ce_ip']} ebgp-multihop {int(ebgp_multihop)}\n"
+
+    # vpnv4 to RR with explicit next-hop-self
     conf += " address-family vpnv4\n"
-    conf += f"  neighbor {rr_loopback} activate\n  neighbor {rr_loopback} send-community both\n"
+    conf += f"  neighbor {rr_loopback} activate\n"
+    conf += f"  neighbor {rr_loopback} send-community both\n"
+    conf += f"  neighbor {rr_loopback} next-hop-self\n"
     conf += " exit-address-family\n"
 
+    # INTERNET VRF AF: redistribute connected/static so it can carry “internet-ish” routes (lab)
+    conf += f" address-family ipv4 vrf {INTERNET_VRF_NAME}\n"
+    conf += "  redistribute connected\n"
+    if add_internet_default:
+        conf += "  redistribute static\n"
+    conf += " exit-address-family\n"
+
+    # Customer VRF AFs
     for _, row in customers_df.iterrows():
-        cust = row["Customer"]
-        cust_neighbors = [n for n in ce_pe_neighbors if n["cust"] == cust]
+        cust = str(row["Customer"])
+        htype = str(row.get("Handoff_Type", "eBGP")).upper()
+        pid = 100 + int(cust.split("_")[-1])
+        cust_neighbors = [n for n in pe_ce_neighbors if n["cust"] == cust]
+
         conf += f" address-family ipv4 vrf {cust}\n"
         conf += "  redistribute connected\n"
-        for n in cust_neighbors:
-            conf += f"  neighbor {n['ce_ip']} activate\n"
+
+        if htype == "EBGP":
+            for n in cust_neighbors:
+                conf += f"  neighbor {n['ce_ip']} activate\n"
+        elif htype == "OSPF":
+            conf += f"  redistribute ospf {pid}\n"
+        elif htype == "STATIC":
+            conf += "  redistribute static\n"
+
         conf += " exit-address-family\n"
+
+    # STATIC handoff: install per-LAN routes via CE IP (inside VRF)
+    for _, row in customers_df.iterrows():
+        cust = str(row["Customer"])
+        htype = str(row.get("Handoff_Type", "eBGP")).upper()
+        if htype != "STATIC":
+            continue
+        for n in pe_ce_neighbors:
+            if n["cust"] != cust:
+                continue
+            for lan in n["ce_lan_subnets"]:
+                lan_net = ipaddress.IPv4Network(lan)
+                conf += f"ip route vrf {cust} {lan_net.network_address} {lan_net.netmask} {n['ce_ip']}\n"
 
     conf += "!\nend\n"
     return conf
 
-def gen_ce_config(ce, iface_access, provider_pe_ip):
+def gen_ce_config(
+    ce,
+    iface_access,
+    provider_pe_ip,
+    bgp_keepalive,
+    bgp_hold,
+    ebgp_multihop
+):
     hostname = ce["hostname"]
-    cust_asn = ce["customer_asn"]
-    lan_net = ipaddress.IPv4Network(ce["lan_subnet"])
-    lan_mask = str(lan_net.netmask)
-    lan_ip = ce["lan_ip"]
+    cust_asn = int(ce["customer_asn"])
+    htype = str(ce.get("handoff_type", "eBGP")).upper()
 
-    conf = f"! *** CE CONFIG FOR {hostname} ({ce['customer']}) eBGP->PE ***\n"
+    conf = f"! *** CE CONFIG FOR {hostname} ({ce['customer']}) HANDOFF={htype} ***\n"
     conf += f"hostname {hostname}\n!\n"
 
     conf += (
@@ -396,18 +514,46 @@ def gen_ce_config(ce, iface_access, provider_pe_ip):
         f" no shutdown\n!\n"
     )
 
-    conf += (
-        f"interface GigabitEthernet0/1\n"
-        f" ip address {lan_ip} {lan_mask}\n"
-        f" no shutdown\n!\n"
-    )
+    for i, (lan_ip, lan_mask) in enumerate(zip(ce["lan_ips"], ce["lan_masks"]), start=1):
+        conf += (
+            f"interface GigabitEthernet0/{i}\n"
+            f" ip address {lan_ip} {lan_mask}\n"
+            f" no shutdown\n!\n"
+        )
 
-    conf += f"router bgp {cust_asn}\n"
-    conf += f" neighbor {provider_pe_ip} remote-as {PROVIDER_ASN}\n"
-    conf += " address-family ipv4\n"
-    conf += f"  network {lan_net.network_address} mask {lan_mask}\n"
-    conf += f"  neighbor {provider_pe_ip} activate\n"
-    conf += " exit-address-family\n!\nend\n"
+    if htype == "EBGP":
+        conf += f"router bgp {cust_asn}\n"
+        conf += " bgp log-neighbor-changes\n"
+        conf += f" timers bgp {bgp_keepalive} {bgp_hold}\n"
+        conf += f" neighbor {provider_pe_ip} remote-as {PROVIDER_ASN}\n"
+        if int(ebgp_multihop) > 1:
+            conf += f" neighbor {provider_pe_ip} ebgp-multihop {int(ebgp_multihop)}\n"
+        conf += " address-family ipv4\n"
+        for lan in ce["lan_subnets"]:
+            lan_net = ipaddress.IPv4Network(lan)
+            conf += f"  network {lan_net.network_address} mask {lan_net.netmask}\n"
+        conf += f"  neighbor {provider_pe_ip} activate\n"
+        conf += " exit-address-family\n!\nend\n"
+        return conf
+
+    if htype == "OSPF":
+        pid = 100 + int(ce["customer"].split("_")[-1])
+        conf += f"router ospf {pid}\n"
+        conf += " passive-interface default\n"
+        conf += f" no passive-interface {iface_access['name']}\n"
+        conf += f" network {iface_access['ip']} 0.0.0.0 area 0\n"
+        for lan in ce["lan_subnets"]:
+            lan_net = ipaddress.IPv4Network(lan)
+            wc = wildcard_from_netmask(str(lan_net.netmask))
+            conf += f" network {lan_net.network_address} {wc} area 0\n"
+        conf += "!\nend\n"
+        return conf
+
+    if htype == "STATIC":
+        conf += f"ip route 0.0.0.0 0.0.0.0 {provider_pe_ip}\n!\nend\n"
+        return conf
+
+    conf += "!\nend\n"
     return conf
 
 # =============================================================================
@@ -416,7 +562,7 @@ def gen_ce_config(ce, iface_access, provider_pe_ip):
 
 def main():
     st.set_page_config(page_title="MPLS Lab Designer", layout="wide")
-    st.title("🌐 MPLS Lab Designer — Resilient Core + VRF + CE eBGP + OOB RR")
+    st.title("🌐 MPLS Lab Designer — Resilient Core + VRFs + Route Leaking via INTERNET VRF")
 
     with st.sidebar:
         st.header("Core (Provider)")
@@ -425,47 +571,62 @@ def main():
         topo_mode = st.selectbox("Topology Mode", ["auto", "small", "medium", "large"], index=0)
 
         st.divider()
-        st.header("Customers (CE via eBGP)")
+        st.header("Customers")
         num_customers = st.number_input("Customers", 1, 50, 3)
         default_ce = st.number_input("Default CE per Customer", 1, 20, 2)
         base_cust_asn = st.number_input("Customer ASN Base", 64512, 65534, 65100)
 
         st.divider()
+        st.header("BGP Options")
+        bgp_keepalive = st.number_input("BGP Keepalive (sec)", 1, 300, 30)
+        bgp_hold = st.number_input("BGP Hold (sec)", 3, 900, 90)
+        ebgp_multihop = st.number_input("eBGP Multihop (CE neighbors)", 1, 50, 1)
+
+        st.divider()
+        st.header("Internet VRF / Leaking")
+        add_internet_default = st.checkbox("Inject default route into INTERNET VRF (Null0)", value=True)
+
+        st.divider()
         st.header("Address Pools")
         lp_pool = st.text_input("Loopback Pool (P/PE only)", "10.255.0.0/23")
         rr_loop_pool = st.text_input("RR Loopback Pool (OOB)", "172.16.255.0/24")
-
         core_p2p_pool = st.text_input("Core P2P Pool (/31 endpoints)", "10.0.0.0/22")
         rr_oob_p2p_pool = st.text_input("RR OOB P2P Pool (/31 endpoints)", "172.16.0.0/24")
-
         access_p2p_pool = st.text_input("Access P2P Pool (PE-CE /31 endpoints)", "10.10.0.0/22")
         ce_lan_pool = st.text_input("CE LAN Pool (carved into /24s)", "192.168.0.0/16")
 
         generate_btn = st.button("🚀 Build Lab", type="primary")
 
     # Editable customer table
-    if "customers_df" not in st.session_state or st.session_state.get("customers_df_seed") != (int(num_customers), int(base_cust_asn), int(default_ce)):
+    seed = (int(num_customers), int(base_cust_asn), int(default_ce))
+    if "customers_df" not in st.session_state or st.session_state.get("customers_df_seed") != seed:
         st.session_state["customers_df"] = default_customers(int(num_customers), base_asn=int(base_cust_asn), default_ce=int(default_ce))
-        st.session_state["customers_df_seed"] = (int(num_customers), int(base_cust_asn), int(default_ce))
+        st.session_state["customers_df_seed"] = seed
 
-    st.subheader("👥 Customers (edit CE count / ASN if you want)")
+    st.subheader("👥 Customers (edit ASN / CE_Routers / Handoff_Type / LANs_per_CE / Leak_Via_Internet)")
     customers_df = st.data_editor(
         st.session_state["customers_df"],
         use_container_width=True,
-        num_rows="fixed"
+        num_rows="fixed",
+        column_config={
+            "Handoff_Type": st.column_config.SelectboxColumn(
+                "Handoff_Type",
+                options=["eBGP", "OSPF", "Static"],
+                help="Customer handoff from CE to PE."
+            ),
+            "Leak_Via_Internet": st.column_config.CheckboxColumn(
+                "Leak_Via_Internet",
+                help="If enabled, customer VRF imports+exports INTERNET RT for route leaking."
+            )
+        }
     )
     st.session_state["customers_df"] = customers_df
 
     if generate_btn:
         try:
-            # -----------------------------
-            # Build router inventory
-            # -----------------------------
+            # Core inventory (P + PE)
             core_total = int(num_p) + int(num_pe)
-
             core_loopbacks = allocate_loopbacks(core_total, lp_pool)
-            rr_loopbacks = allocate_loopbacks(1, rr_loop_pool)
-            rr_loopback = rr_loopbacks[0]
 
             routers = []
             p_lbs, pe_lbs = [], []
@@ -481,17 +642,14 @@ def main():
                 routers.append(r)
                 pe_lbs.append(r["loopback"])
 
-            # RR as its own node AFTER core
+            # RR
+            rr_loopback = allocate_loopbacks(1, rr_loop_pool)[0]
             rr_index = core_total
             rr = {"type": "RR", "hostname": "RR-OOB", "loopback": rr_loopback, "index": rr_index}
             routers.append(rr)
 
-            # -----------------------------
-            # Core topology edges (P/PE)
-            # -----------------------------
+            # Core edges + RR edges
             core_edges = create_core_topology(int(num_p), int(num_pe), mode=topo_mode)
-
-            # RR OOB edges -> connect RR to two P routers for resilience
             rr_edges = []
             p_attach_a = 0
             p_attach_b = 1 if int(num_p) > 1 else 0
@@ -499,39 +657,28 @@ def main():
             if p_attach_b != p_attach_a:
                 rr_edges.append((p_attach_b, rr_index))
 
-            # -----------------------------
             # Customers / CEs
-            # -----------------------------
             pe_core_indices = list(range(int(num_p), int(num_p) + int(num_pe)))
             ces = assign_ces(customers_df, pe_core_indices)
-            ces = allocate_ce_lans(ces, ce_lan_pool, lan_prefix=24)
+            ces = allocate_ce_lans_multi(ces, ce_lan_pool, lan_prefix=24)
 
-            # Add CE nodes to routers list (after RR)
             ce_start_index = len(routers)
             for i, ce in enumerate(ces):
                 ce["index"] = ce_start_index + i
                 routers.append(ce)
 
-            # Access edges (PE<->CE)
-            access_edges = []
-            for ce in ces:
-                access_edges.append((ce["pe_attach_core_index"], ce["index"]))
+            access_edges = [(ce["pe_attach_core_index"], ce["index"]) for ce in ces]
 
-            # -----------------------------
-            # IP allocation for links
-            # -----------------------------
-            # Core links
+            # Allocate IPs
             core_p2p = allocate_p2p_links(len(core_edges), core_p2p_pool)
-            # RR OOB links
             rr_p2p = allocate_p2p_links(len(rr_edges), rr_oob_p2p_pool)
-            # Access links
             access_p2p = allocate_p2p_links(len(access_edges), access_p2p_pool)
 
-            # Interfaces + connection details
+            # Interfaces and connection details
             total_nodes = len(routers)
             iface_counters = {i: 0 for i in range(total_nodes)}
-            router_ifaces_core = {i: [] for i in range(total_nodes)}   # core+oob (ospf)
-            router_ifaces_access = {i: [] for i in range(total_nodes)} # pe-ce (vrf on pe)
+            router_ifaces_core = {i: [] for i in range(total_nodes)}
+            router_ifaces_access = {i: [] for i in range(total_nodes)}
             conn_details = []
 
             def add_link(a, b, ip_a, ip_b, link_type, vrf=None, core_link=True):
@@ -540,16 +687,12 @@ def main():
                 iface_counters[a] += 1
                 iface_counters[b] += 1
 
-                # If core_link: OSPF + (MPLS later for P/PE) on PE/P, RR just OSPF
                 if core_link:
                     router_ifaces_core[a].append({"name": if_a, "ip": ip_a, "mask": "255.255.255.254"})
                     router_ifaces_core[b].append({"name": if_b, "ip": ip_b, "mask": "255.255.255.254"})
                 else:
-                    # access: PE side uses vrf, CE side plain
-                    # Determine which side is PE
                     a_type = routers[a]["type"]
                     b_type = routers[b]["type"]
-
                     if a_type == "PE":
                         router_ifaces_access[a].append({"name": if_a, "ip": ip_a, "mask": "255.255.255.254", "vrf": vrf})
                         router_ifaces_access[b].append({"name": if_b, "ip": ip_b, "mask": "255.255.255.254"})
@@ -557,7 +700,6 @@ def main():
                         router_ifaces_access[b].append({"name": if_b, "ip": ip_b, "mask": "255.255.255.254", "vrf": vrf})
                         router_ifaces_access[a].append({"name": if_a, "ip": ip_a, "mask": "255.255.255.254"})
                     else:
-                        # fallback
                         router_ifaces_access[a].append({"name": if_a, "ip": ip_a, "mask": "255.255.255.254"})
                         router_ifaces_access[b].append({"name": if_b, "ip": ip_b, "mask": "255.255.255.254"})
 
@@ -574,39 +716,30 @@ def main():
                     conn["VRF"] = vrf
                 conn_details.append(conn)
 
-            # Core edges
             for i, (a, b) in enumerate(core_edges):
                 ip_a, ip_b = core_p2p[i]
                 add_link(a, b, ip_a, ip_b, link_type="CORE", core_link=True)
 
-            # RR OOB edges (still OSPF so PEs can reach RR loopback)
             for i, (a, b) in enumerate(rr_edges):
                 ip_a, ip_b = rr_p2p[i]
                 add_link(a, b, ip_a, ip_b, link_type="OOB-RR", core_link=True)
 
-            # Access edges (PE-CE), VRF based on CE customer
             ce_by_index = {ce["index"]: ce for ce in ces}
             for i, (a, b) in enumerate(access_edges):
                 ip_a, ip_b = access_p2p[i]
                 ce = ce_by_index[b] if routers[b]["type"] == "CE" else ce_by_index[a]
                 add_link(a, b, ip_a, ip_b, link_type="ACCESS", vrf=ce["customer"], core_link=False)
 
-            # -----------------------------
-            # Build CE neighbor mapping per PE (for PE VRF eBGP activation)
-            # -----------------------------
-            pe_ce_neighbors = {idx: [] for idx in pe_core_indices}
+            hostname_to_index = {r["hostname"]: idx for idx, r in enumerate(routers)}
 
-            # We need to know CE IP and PE IP on the /31
-            # Use conn_details to derive it per ACCESS link
+            # CE neighbor mapping per PE
+            pe_ce_neighbors = {idx: [] for idx in pe_core_indices}
             for conn in conn_details:
                 if conn.get("LINK_TYPE") != "ACCESS":
                     continue
-                # Identify which side is PE
-                from_name = conn["From"]
-                to_name = conn["To"]
-                a_idx = next(i for i, r in enumerate(routers) if r["hostname"] == from_name)
-                b_idx = next(i for i, r in enumerate(routers) if r["hostname"] == to_name)
 
+                a_idx = hostname_to_index[conn["From"]]
+                b_idx = hostname_to_index[conn["To"]]
                 a_type = routers[a_idx]["type"]
                 b_type = routers[b_idx]["type"]
 
@@ -629,23 +762,26 @@ def main():
                     "cust_asn": ce["customer_asn"],
                     "ce_ip": ce_ip,
                     "pe_ip": pe_ip,
-                    "ce_hostname": ce["hostname"]
+                    "ce_hostname": ce["hostname"],
+                    "handoff_type": ce["handoff_type"],
+                    "ce_lan_subnets": ce["lan_subnets"],
                 })
 
-            # -----------------------------
             # Generate configs
-            # -----------------------------
             configs = {}
 
-            # P configs (no BGP)
             for r in routers:
                 if r["type"] == "P":
                     configs[r["hostname"]] = gen_p_config(r, router_ifaces_core[r["index"]])
 
-            # RR config
-            configs[rr["hostname"]] = gen_rr_config(rr, router_ifaces_core[rr_index], pe_lbs)
+            configs[rr["hostname"]] = gen_rr_config(
+                rr,
+                router_ifaces_core[rr_index],
+                pe_lbs,
+                bgp_keepalive=int(bgp_keepalive),
+                bgp_hold=int(bgp_hold)
+            )
 
-            # PE configs
             for r in routers:
                 if r["type"] == "PE":
                     configs[r["hostname"]] = gen_pe_config(
@@ -654,21 +790,28 @@ def main():
                         ifaces_access=router_ifaces_access[r["index"]],
                         customers_df=customers_df,
                         rr_loopback=rr_loopback,
-                        ce_pe_neighbors=pe_ce_neighbors[r["index"]]
+                        pe_ce_neighbors=pe_ce_neighbors[r["index"]],
+                        bgp_keepalive=int(bgp_keepalive),
+                        bgp_hold=int(bgp_hold),
+                        ebgp_multihop=int(ebgp_multihop),
+                        add_internet_default=bool(add_internet_default)
                     )
 
-            # CE configs
-            # Need CE access iface + provider PE IP on that link
             for ce in ces:
                 ce_idx = ce["index"]
-                # Find that CE's access link in neighbors map
                 pe_idx = ce["pe_attach_core_index"]
                 n = next(x for x in pe_ce_neighbors[pe_idx] if x["ce_hostname"] == ce["hostname"])
-                # CE iface: first (and only) in router_ifaces_access
                 ce_iface = router_ifaces_access[ce_idx][0]
-                configs[ce["hostname"]] = gen_ce_config(ce, ce_iface, provider_pe_ip=n["pe_ip"])
 
-            # Save state
+                configs[ce["hostname"]] = gen_ce_config(
+                    ce,
+                    iface_access=ce_iface,
+                    provider_pe_ip=n["pe_ip"],
+                    bgp_keepalive=int(bgp_keepalive),
+                    bgp_hold=int(bgp_hold),
+                    ebgp_multihop=int(ebgp_multihop)
+                )
+
             st.session_state.update({
                 "configs": configs,
                 "routers": routers,
@@ -678,19 +821,22 @@ def main():
                     "topology": conn_details,
                     "customers": customers_df.to_dict(orient="records"),
                     "rr": rr,
+                    "internet_vrf": {"name": INTERNET_VRF_NAME, "rd": INTERNET_RD, "rt": INTERNET_RT},
                     "configs": configs,
                     "counts": {"P": int(num_p), "PE": int(num_pe), "RR": 1, "CE": len(ces)},
-                    "topology_mode": topo_mode
+                    "topology_mode": topo_mode,
+                    "bgp": {
+                        "keepalive": int(bgp_keepalive),
+                        "hold": int(bgp_hold),
+                        "ebgp_multihop": int(ebgp_multihop)
+                    }
                 }
             })
 
         except Exception as e:
             st.error(f"Build failed: {e}")
 
-    # =============================================================================
-    # OUTPUTS
-    # =============================================================================
-
+    # Outputs
     if "configs" in st.session_state and st.session_state.get("conn_details"):
         c1, c2, c3 = st.columns(3)
 
